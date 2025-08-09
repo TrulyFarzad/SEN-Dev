@@ -8,7 +8,6 @@ import jdatetime
 
 # TODO: use better method for last-night duplicate deletion
 # TODO: speed up search.xlsx loading time
-# TODO: ستون پله درآمد
 
 # تاریخ شمسی برای افزودن به نام فایل‌ها
 today_jalali = jdatetime.date.today().strftime("%y%m%d")
@@ -21,6 +20,7 @@ last_night_path = os.path.join(user_desktop, "last-night.xlsx")
 search_path = os.path.join(user_desktop, "search.xlsx")
 report_day_path = os.path.join(user_desktop, "takhsisReport.xlsx")
 report_month_path = os.path.join(user_desktop, "takhsisReport-m.xlsx")
+rating_path = os.path.join(user_desktop, "rating.xlsx")
 
 # --- بارگذاری فایل‌ها ---
 print("📂 Reading file in-wait in:", in_wait_path)
@@ -37,6 +37,9 @@ report_day = pd.read_excel(report_day_path)
 
 print("📂 Reading file takhsisReport-m in:", report_month_path)
 report_month = pd.read_excel(report_month_path)
+
+print("📂 Reading file rating in:", rating_path)
+rating = pd.read_excel(rating_path, dtype={"کد پذیرنده": str})
 
 # حذف ستون‌های اضافی از in-wait
 columns_to_keep = [
@@ -76,17 +79,27 @@ merged = pd.merge(
     how="left"
 )
 
+# Merge step 3: with rating for پله درآمد
+merged = pd.merge(
+    merged,
+    rating,
+    on="کد پذیرنده",
+    how="left"
+)
+
 # توضیحات نهایی با در نظر گرفتن شرایط خاص
-merged["توضیحات"] = merged["توضیحات"].fillna("نصب اولیه")
+mask_missing = ~merged["کد پذیرنده"].isin(last_night_info["کد پذیرنده"])
+merged.loc[mask_missing, "توضیحات"] = "نصب اولیه"
 merged.loc[merged["توضیحات"] == "--", "توضیحات"] = ""
-merged["توضیحات"] = merged["توضیحات"].apply(lambda x: x.split(" - ")[0].strip() if isinstance(x, str) else x)
+merged["توضیحات"] = merged["توضیحات"].fillna("")
+merged["توضیحات"] = merged["توضیحات"].apply(lambda x: x.split(" - ")[0].strip() if isinstance(x, str) and " - " in x else x)
 
 # گروه پایانه بر اساس مدل پوز
 merged["گروه پایانه"] = merged["مدل پوز"].apply(get_pos_type)
 
 # انتخاب و ساخت جدول نهایی
 result_cols = [
-    "کد پذیرنده", "نام فروشگاه", "توضیحات", "شهر", "آدرس", "نام و نام خانوادگی پشتیبان",
+    "کد پذیرنده", "نام فروشگاه", "پله درآمد", "توضیحات", "شهر", "آدرس", "نام و نام خانوادگی پشتیبان",
     "گروه پایانه", "کد درخواست", "کد پیگیری", "مدل پوز", "گروه پروژه",
     "تاریخ ایجاد", "آخرین تاریخ ویرایش", "شماره حساب"
 ]
