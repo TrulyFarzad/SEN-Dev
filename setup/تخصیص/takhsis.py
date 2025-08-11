@@ -8,6 +8,8 @@ import jdatetime
 
 # TODO: use better method for last-night duplicate deletion
 # TODO: speed up search.xlsx loading time
+# TODO: fix گزارش تخصیص format
+# TODO: fix repetitive entries in takhsis file with کد درخواست.
 
 # تاریخ شمسی برای افزودن به نام فایل‌ها
 today_jalali = jdatetime.date.today().strftime("%y%m%d")
