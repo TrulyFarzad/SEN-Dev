@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
 import os
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
 from openpyxl.worksheet.views import SheetView
 from datetime import datetime
 import jdatetime
@@ -32,11 +32,18 @@ last_night = pd.read_excel(last_night_path, dtype={"کد پذیرنده": str})
 print("📂 Reading file search in:", search_path)
 search = pd.read_excel(search_path, dtype={"کد پذیرنده": str, "سریال پایانه": str})
 
-print("📂 Reading file takhsisReport in:", report_day_path)
-report_day = pd.read_excel(report_day_path)
+# گزارش‌های تخصیص (ممکن است نباشند)
+try:
+    print("📂 Reading file takhsisReport in:", report_day_path)
+    report_day = pd.read_excel(report_day_path)
+except Exception:
+    report_day = pd.DataFrame()
 
-print("📂 Reading file takhsisReport-m in:", report_month_path)
-report_month = pd.read_excel(report_month_path)
+try:
+    print("📂 Reading file takhsisReport-m in:", report_month_path)
+    report_month = pd.read_excel(report_month_path)
+except Exception:
+    report_month = pd.DataFrame()
 
 print("📂 Reading file rating in:", rating_path)
 rating = pd.read_excel(rating_path, dtype={"کد پذیرنده": str})
@@ -51,9 +58,9 @@ in_wait = in_wait[[col for col in columns_to_keep if col in in_wait.columns]]
 # Helper: POS type based on model
 def get_pos_type(model):
     if pd.isna(model): return ""
-    if model.strip().upper() == "GPRS":
+    if str(model).strip().upper() == "GPRS":
         return "بیسیم"
-    elif model.strip().upper() in ["LAN", "DIALUP", "PCPOSLAN"]:
+    elif str(model).strip().upper() in ["LAN", "DIALUP", "PCPOSLAN"]:
         return "ثابت"
     return "نامشخص"
 
@@ -110,37 +117,6 @@ final_result = merged[[col for col in result_cols if col in merged.columns]].cop
 initial_installs = final_result[final_result["توضیحات"] == "نصب اولیه"].copy()
 filtered_result = final_result[final_result["گروه پروژه"] != "پروژه فروش"].copy()
 
-# ---- ساخت گزارش تخصیص ----
-report_sections = []
-
-# بخش 1: در انتظار تخصیص
-waiting_total = len(filtered_result)
-waiting_fixed = (filtered_result["گروه پایانه"] == "ثابت").sum()
-waiting_wireless = (filtered_result["گروه پایانه"] == "بیسیم").sum()
-report_sections.append(pd.DataFrame({
-    "نوع": ["کل درخواست‌ها", "درخواست‌های ثابت", "درخواست‌های سیار"],
-    "تعداد": [waiting_total, waiting_fixed, waiting_wireless]
-}))
-
-# Helper برای گزارش پروژه‌ها
-def project_counts(df):
-    persian_switch = df[df["پروژه"].str.contains("پرشين", na=False)].shape[0]
-    sales_project = df[df["پروژه"].str.contains("فروش", na=False)].shape[0]
-    bank_project = len(df) - persian_switch - sales_project
-    return pd.DataFrame({
-        "نوع": ["پروژه پرشین سوییچ", "پروژه فروش", "پروژه بانکی", "مجموع"],
-        "تعداد": [persian_switch, sales_project, bank_project, persian_switch + sales_project + bank_project]
-    })
-
-# بخش 2: تخصیص‌های روز قبل
-report_sections.append(project_counts(report_day))
-
-# بخش 3: تخصیص‌های از اول ماه
-report_sections.append(project_counts(report_month))
-
-# ترکیب بخش‌ها
-allocation_report = pd.concat(report_sections, keys=["در انتظار تخصیص", "تخصیص روز قبل", "تخصیص از اول ماه"], names=["بخش", "ردیف"])
-
 # ذخیره فایل تخصیص با تنظیم راست‌به‌چپ
 output_path = os.path.join(user_desktop, f"takhsis{today_jalali}.xlsx")
 filtered_result.to_excel(output_path, index=False, sheet_name="نتیجه")
@@ -157,12 +133,55 @@ ws2 = wb2["نصب اولیه"]
 ws2.sheet_view.rightToLeft = True
 wb2.save(initial_path)
 
-# ذخیره گزارش تخصیص با تنظیم راست‌به‌چپ
+# ---- ساخت «گزارش تخصیص» با فرمت نمونه ----
+# شمارش «در انتظار تخصیص»
+waiting_total = len(filtered_result)
+waiting_fixed = (filtered_result["گروه پایانه"] == "ثابت").sum()
+waiting_wireless = (filtered_result["گروه پایانه"] == "بیسیم").sum()
+
+# Helper: شمارش پروژه‌ها
+def _count_projects(df: pd.DataFrame):
+    if df is None or df.empty or ("پروژه" not in df.columns):
+        return {"ps": 0, "sales": 0, "bank": 0, "total": 0}
+    col = df["پروژه"].astype(str).fillna("").str.strip()
+    ps = col.str.contains("پرشین|پرشين", case=False, regex=True).sum()
+    sales = col.str.contains("فروش", case=False, regex=True).sum()
+    total = len(df)
+    bank = total - ps - sales
+    return {"ps": int(ps), "sales": int(sales), "bank": int(bank), "total": int(total)}
+
+cnt_day = _count_projects(report_day)
+cnt_month = _count_projects(report_month)
+
+wb_report = Workbook()
+wsr = wb_report.active
+wsr.title = "گزارش"
+
+# ردیف‌ها مطابق فایل نمونه
+wsr["A1"] = "گزارشات"; wsr["B1"] = "تعداد"
+wsr["A2"] = "کل در انتظار تخصیص "; wsr["B2"] = waiting_total
+wsr["A3"] = "در انتظار تخصیص ثابت"; wsr["B3"] = waiting_fixed
+wsr["A4"] = "در انتظار تخصیص سیار"; wsr["B4"] = waiting_wireless
+wsr["A5"] = "تعداد تخصیص پوز روز قبل پروژه بانکی "; wsr["B5"] = cnt_day["bank"]
+wsr["A6"] = " تعداد تخصیص پوز روز قبل پرشین"; wsr["B6"] = cnt_day["ps"]
+wsr["A7"] = "تعداد تخصیص پوز روز قبل پروژه فروش"; wsr["B7"] = cnt_day["sales"]
+wsr["A8"] = "تعداد تخصیص پوز این ماه پروژه بانکی "; wsr["B8"] = cnt_month["bank"]
+wsr["A9"] = " تعداد تخصیص پوز این ماه پرشین"; wsr["B9"] = cnt_month["ps"]
+wsr["A10"] = "تعداد تخصیص پوز این ماه پروژه فروش"; wsr["B10"] = cnt_month["sales"]
+
+# ادغام و جمع کل‌ها (همانند فایل نمونه)
+wsr.merge_cells("C5:C7"); wsr.merge_cells("D5:D7")
+wsr.merge_cells("C8:C10"); wsr.merge_cells("D8:D10")
+wsr["D5"] = "جمع کل تخصیص یافته "; wsr["C5"] = cnt_day["total"]
+wsr["D8"] = "جمع کل تخصیص یافته "; wsr["C8"] = cnt_month["total"]
+
+# راست‌به‌چپ و عرض ستون‌ها
+wsr.sheet_view.rightToLeft = True
+from openpyxl.utils import get_column_letter
+for col, width in zip(["A", "B", "C", "D"], [42, 12, 16, 24]):
+    wsr.column_dimensions[col].width = width
+
 allocation_path = os.path.join(user_desktop, f"گزارش تخصیص{today_jalali}.xlsx")
-allocation_report.to_excel(allocation_path, sheet_name="گزارش")
-wb3 = load_workbook(allocation_path)
-ws3 = wb3["گزارش"]
-ws3.sheet_view.rightToLeft = True
-wb3.save(allocation_path)
+wb_report.save(allocation_path)
 
 print("\n✅ فایل‌ها ذخیره شدند!\n📁", output_path, "\n📁", initial_path, "\n📁", allocation_path)
