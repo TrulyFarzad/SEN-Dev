@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-noInstall.py — نگهداری «توضیح» بین اجراها + ستون‌های «از_نزد_پشتیبان»، «پایه_تاخیر»، «هشدار_احتمال_تقلب»
-و استایل رنگی برای هشدار/تاخیر
+noInstall.py — نصب‌خیر با:
+- نگهداری «توضیح» بین اجراها
+- پرچم «از_نزد_پشتیبان»، «پایه_تاخیر»
+- Fraud detection: اگر 1025 > خروج → هشدار و عدم آرشیو
+- حذف خودکار «غیرفعال‌شده‌ها» (disable.xlsx) از Pending و Sheet2 (بدون تاریخ نصب) + ثبت در Disabled_Log
+- استایل رنگی برای هشدار و تاخیر
+- شیت‌ها Right-to-Left
 """
 
 import sys, os, shutil, re
@@ -44,7 +49,7 @@ def extract_day_key(v) -> int|None:
     if pd.isna(v): return None
     digits = "".join(ch for ch in str(v) if ch.isdigit())
     if len(digits) < 8: return None
-    return int(digits[:8])  # YYYYMMDD (Jalali)
+    return int(digits[:8])  # YYYYMMDD (جلالی)
 
 def pretty_jalali(v) -> str|None:
     k = extract_day_key(v)
@@ -118,12 +123,14 @@ def load_inputs():
     f_install = INPUT_DIR/"install.xlsx"
     f_1025    = INPUT_DIR/"1025.xlsx"
     f_exit    = INPUT_DIR/"خروج.xlsx"
-    missing   = [p.name for p in (f_install,f_1025,f_exit) if not p.exists()]
+    f_disable = INPUT_DIR/"disable.xlsx"
+    missing   = [p.name for p in (f_install,f_1025,f_exit,f_disable) if not p.exists()]
     if missing:
         raise FileNotFoundError("فایل‌های ورودی در noInstall/input نیستند: " + ", ".join(missing))
     return (normalize_columns(pd.read_excel(f_install)),
             normalize_columns(pd.read_excel(f_1025)),
-            normalize_columns(pd.read_excel(f_exit)))
+            normalize_columns(pd.read_excel(f_exit)),
+            normalize_columns(pd.read_excel(f_disable)))
 
 def build_1025_index(df_1025, serial_col, date_col):
     tmp = df_1025[[serial_col, date_col]].copy()
@@ -156,6 +163,43 @@ def build_exit_index_with_flag(df_exit, serial_col, date_col):
     d={}
     for s,grp in tmp.groupby(serial_col):
         d[str(s)] = [t for t in grp["_t"].tolist() if t is not None]
+    return d
+
+def build_disable_index(df_disable, serial_col):
+    """
+    اندیس disable بر اساس «تاریخ پایان تخصیص» (در صورت نبود، fallback هوشمند)
+    خروجی: dict[serial] = [(day_key, pretty_str, merchant_code_str), ...]  (جدیدترین اول)
+    """
+    # ستون تاریخ هدف
+    date_col = "تاریخ پایان تخصیص"
+    if date_col not in df_disable.columns:
+        # fallback: هر ستونی که «پایان تخصیص» در نام دارد
+        cand = [c for c in df_disable.columns if "پایان تخصیص" in c]
+        if cand:
+            date_col = cand[0]
+        else:
+            # در نهایت اولین ستونی که «تاریخ» دارد
+            cand = [c for c in df_disable.columns if "تاریخ" in c]
+            if cand:
+                date_col = cand[0]
+            else:
+                return {}
+
+    merch_col = "کد پذیرنده" if "کد پذیرنده" in df_disable.columns else None
+    cols = [serial_col, date_col] + ([merch_col] if merch_col else [])
+    tmp = df_disable[cols].copy()
+    tmp["_day"]    = tmp[date_col].apply(extract_day_key)
+    tmp["_pretty"] = tmp[date_col].apply(pretty_jalali)
+    if merch_col:
+        tmp["_merch"] = tmp[merch_col].astype(str)
+    else:
+        tmp["_merch"] = ""
+
+    tmp = tmp.dropna(subset=["_day"]).sort_values("_day", ascending=False)
+
+    d={}
+    for s, grp in tmp.groupby(serial_col):
+        d[str(s)] = list(zip(grp["_day"].tolist(), grp["_pretty"].tolist(), grp["_merch"].tolist()))
     return d
 
 def pick_exit_after_alloc(exit_idx:dict, serial:str, alloc_day:int|None):
@@ -197,7 +241,7 @@ def coalesce_text(a, b):
 
 # -------------------- اجرای اصلی --------------------
 def main():
-    df_install_full, df_1025, df_exit = load_inputs()
+    df_install_full, df_1025, df_exit, df_disable = load_inputs()
 
     serial_col = "سریال پایانه"
     alloc_col  = "تاریخ تخصیص تجهیز"
@@ -224,8 +268,9 @@ def main():
         df_exit.rename(columns={"سریال": serial_col}, inplace=True)
     exit_date_col = next(c for c in df_exit.columns if "تاریخ" in c)
 
-    idx_1025 = build_1025_index(df_1025, serial_col, date_col_1025)
-    idx_exit = build_exit_index_with_flag(df_exit, serial_col, exit_date_col)
+    idx_1025    = build_1025_index(df_1025, serial_col, date_col_1025)
+    idx_exit    = build_exit_index_with_flag(df_exit, serial_col, exit_date_col)
+    idx_disable = build_disable_index(df_disable, serial_col)
 
     # Pending
     rows=[]
@@ -265,12 +310,34 @@ def main():
             prev_pending[["سریال پایانه","توضیح"]],
             on="سریال پایانه", how="left", suffixes=("", "_old")
         )
-        # coalesce: اگر توضیح جدید خالی است، از قدیمی بردار
         df_pending["توضیح"] = df_pending.apply(
             lambda r: coalesce_text(r.get("توضیح"), r.get("توضیح_old")), axis=1
         )
         if "توضیح_old" in df_pending.columns:
             df_pending.drop(columns=["توضیح_old"], inplace=True)
+
+    # ---------------- حذف از Pending بر اساس disable ----------------
+    disabled_log_rows = []
+    if not df_pending.empty:
+        keep_mask = []
+        for _, row in df_pending.iterrows():
+            serial = str(row["سریال پایانه"]).strip()
+            merch  = str(row.get("کد پذیرنده","")).strip()
+            alloc_day = extract_day_key(row.get("تاریخ تخصیص تجهیز"))
+            dis_items = idx_disable.get(serial, [])
+            picked = None
+            # جدیدترین غیرفعال بعد از تخصیص، با ترجیح match کد پذیرنده
+            for dday, dpretty, dmerch in dis_items:
+                if alloc_day is not None and dday >= alloc_day and (merch=="" or dmerch==merch):
+                    picked = (dday, dpretty); break
+            if picked is None:
+                keep_mask.append(True)
+            else:
+                log = dict(row)
+                log["تاریخ غیر فعال"] = picked[1]  # pretty از «تاریخ پایان تخصیص»
+                disabled_log_rows.append(log)
+                keep_mask.append(False)
+        df_pending = df_pending[keep_mask].copy()
 
     # شروع اجرا: شیت۲ قبلی را از نصب‌شده‌های بدون هشدار پاک کن
     sheet2 = prev_sheet2.copy()
@@ -292,6 +359,30 @@ def main():
     if newly_installed_serials:
         new_cands = prev_pending[prev_pending["سریال پایانه"].astype(str).isin(newly_installed_serials)].copy()
         sheet2 = pd.concat([sheet2, new_cands], ignore_index=True)
+
+    # ---------------- حذف از Sheet2 بر اساس disable (فقط بدون تاریخ نصب) ----------------
+    if not sheet2.empty:
+        keep_mask2 = []
+        for _, row in sheet2.iterrows():
+            if pd.notna(row.get("تاریخ نصب")):
+                keep_mask2.append(True)
+                continue
+            serial = str(row["سریال پایانه"]).strip()
+            merch  = str(row.get("کد پذیرنده","")).strip()
+            alloc_day = extract_day_key(row.get("تاریخ تخصیص تجهیز"))
+            dis_items = idx_disable.get(serial, [])
+            picked = None
+            for dday, dpretty, dmerch in dis_items:
+                if alloc_day is not None and dday >= alloc_day and (merch=="" or dmerch==merch):
+                    picked = (dday, dpretty); break
+            if picked is None:
+                keep_mask2.append(True)
+            else:
+                log = dict(row)
+                log["تاریخ غیر فعال"] = picked[1]
+                disabled_log_rows.append(log)
+                keep_mask2.append(False)
+        sheet2 = sheet2[keep_mask2].copy()
 
     # تکمیل «تاریخ نصب» و «تاخیر» و «پایه_تاخیر» + Fraud
     df_lu = df_install_full.copy()
@@ -363,6 +454,10 @@ def main():
     if not installed_now.empty:
         archive = pd.concat([archive, installed_now], ignore_index=True)
 
+    # Disabled_Log شیت چهارم
+    disabled_log = pd.DataFrame(disabled_log_rows) if disabled_log_rows else pd.DataFrame(columns=list(df_pending.columns)+["تاریخ غیر فعال"])
+    disabled_log = normalize_columns(disabled_log)
+
     # یکتاسازی Sheet2
     if not sheet2.empty:
         sheet2 = sheet2.reset_index(drop=True)
@@ -374,14 +469,13 @@ def main():
         df_pending.to_excel(w, index=False, sheet_name="Pending")
         sheet2.to_excel(w, index=False, sheet_name="Installed_Candidates")
         archive.to_excel(w, index=False, sheet_name="Archive")
+        disabled_log.to_excel(w, index=False, sheet_name="Disabled_Log")
 
-        # Right-to-Left
-        for sh in ["Pending","Installed_Candidates","Archive"]:
+        for sh in ["Pending","Installed_Candidates","Archive","Disabled_Log"]:
             w.sheets[sh].right_to_left()
 
         # های‌لایت‌ها روی Sheet2
         ws2 = w.sheets["Installed_Candidates"]
-
         cols2 = list(sheet2.columns)
         try:
             warn_idx = cols2.index("هشدار_احتمال_تقلب")
@@ -389,13 +483,12 @@ def main():
         except ValueError:
             warn_idx, delay_idx = None, None
 
-        warn_format = w.book.add_format({"bg_color": "#F8D7DA", "bold": True})
+        warn_format  = w.book.add_format({"bg_color": "#F8D7DA", "bold": True})
         delay_format = w.book.add_format({"bg_color": "#FFE5B4"})
 
         nrows = len(sheet2) + 1
         ncols = len(cols2)
 
-        # هشدار: کل ردیف قرمز کم‌رنگ
         if warn_idx is not None and nrows > 1:
             warn_col_letter = col_letter(warn_idx)
             ws2.conditional_format(f"A2:{col_letter(ncols-1)}{nrows}", {
@@ -403,8 +496,6 @@ def main():
                 "criteria": f'=${warn_col_letter}2=TRUE',
                 "format": warn_format
             })
-
-        # تاخیر>0: سلول تاخیر نارنجی
         if delay_idx is not None and nrows > 1:
             delay_col_letter = col_letter(delay_idx)
             ws2.conditional_format(f"{delay_col_letter}2:{delay_col_letter}{nrows}", {
