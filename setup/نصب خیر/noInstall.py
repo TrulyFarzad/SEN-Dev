@@ -1,30 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-noInstall.py — نسخه با منطق «نزد پشتیبان» و مقایسه‌ی خروج فقط با تخصیص
-- Pending از install با «وضعیت نصب = خیر»
-- انتخاب تاریخ‌ها (همه در سطح روز و استاندارد YYYY/MM/DD):
-    تخصیص: از install
-    1025: اولین رکورد با day >= تخصیص (اگر باشد)
-    خروج: فقط با تخصیص مقایسه می‌شود؛
-          اگر خروجِ «نزد پشتیبان» بعد از تخصیص بود → همان، flag=True
-          وگرنه اولین خروج بعد از تخصیص → flag=False
-- ستون جدید: «از_نزد_پشتیبان» (True/False)
-- تأخیر:
-    اگر از_نزد_پشتیبان=True → base=خروج
-    اگر False → base=1025
-    delay = max(0, (install - base) - SLA)  | SLA: مشهد=2 روز، بقیه=5
-- شروع هر اجرا: شیت۲ قدیمی از ردیف‌های تاریخ‌نصب‌دار پاک می‌شود (بدون انتقال)
-- پایان همین اجرا: نصب‌شده‌های این اجرا در شیت۲ می‌مانند و به آرشیو (شیت۳) هم کپی می‌شوند
-- شیت‌ها Right-to-Left
+noInstall.py — با ستون‌های «از_نزد_پشتیبان»، «پایه_تاخیر»، «هشدار_احتمال_تقلب»
+و استایل رنگی برای هشدار/تاخیر در اکسل (xlsxwriter)
 """
 
-import sys
-import os
-import shutil
+import sys, os, shutil, re
 from datetime import date as _date, date
 from pathlib import Path
 import pandas as pd
-import re
 
 try:
     import xlsxwriter
@@ -43,19 +26,13 @@ DESKTOP   = get_desktop()
 BASE_DIR  = DESKTOP / "noInstall"
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT    = BASE_DIR / "install_kheir_output.xlsx"
-
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------- Helper ها --------------------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = (
-        df.columns.astype(str)
-        .str.replace("ي","ی")
-        .str.replace("ك","ک")
-        .str.strip()
-    )
+    df.columns = df.columns.astype(str).str.replace("ي","ی").str.replace("ك","ک").str.strip()
     return df
 
 def normalize_text(v) -> str:
@@ -67,7 +44,7 @@ def extract_day_key(v) -> int|None:
     if pd.isna(v): return None
     digits = "".join(ch for ch in str(v) if ch.isdigit())
     if len(digits) < 8: return None
-    return int(digits[:8])  # YYYYMMDD (جلالی)
+    return int(digits[:8])  # YYYYMMDD (Jalali)
 
 def pretty_jalali(v) -> str|None:
     k = extract_day_key(v)
@@ -124,7 +101,7 @@ def read_prev_triplet(prev_path: Path):
         "تاریخ تخصیص تجهیز","تاریخ تراکنش 1025","خروج","از_نزد_پشتیبان",
         "توضیح","مهلت","تاریخ نصب"
     ]
-    ext  = cols1 + ["تحویل پست","تاخیر روز"]
+    ext  = cols1 + ["پایه_تاخیر","تحویل پست","تاخیر روز","هشدار_احتمال_تقلب"]
     if not prev_path or not prev_path.exists():
         return pd.DataFrame(columns=cols1), pd.DataFrame(columns=ext), pd.DataFrame(columns=ext)
     xls = pd.ExcelFile(prev_path)
@@ -137,7 +114,6 @@ def read_prev_triplet(prev_path: Path):
         except: return pd.DataFrame(columns=cols)
     return safe(0,cols1), safe(1,ext), safe(2,ext)
 
-# -------------------- ورودی‌ها --------------------
 def load_inputs():
     f_install = INPUT_DIR/"install.xlsx"
     f_1025    = INPUT_DIR/"1025.xlsx"
@@ -149,7 +125,6 @@ def load_inputs():
             normalize_columns(pd.read_excel(f_1025)),
             normalize_columns(pd.read_excel(f_exit)))
 
-# -------------------- اندیس‌ها (با پرچم نزد پشتیبان) --------------------
 def build_1025_index(df_1025, serial_col, date_col):
     tmp = df_1025[[serial_col, date_col]].copy()
     tmp["_day"]    = tmp[date_col].apply(extract_day_key)
@@ -166,7 +141,6 @@ def build_exit_index_with_flag(df_exit, serial_col, date_col):
     tmp = df_exit[cols].copy()
     tmp["_day"]    = tmp[date_col].apply(extract_day_key)
     tmp["_pretty"] = tmp[date_col].apply(pretty_jalali)
-
     def make_tuple(row):
         day = row["_day"]
         if day is None: return None
@@ -177,28 +151,22 @@ def build_exit_index_with_flag(df_exit, serial_col, date_col):
             if pretty is not None and is_nazd:
                 pretty = pretty + " - نزد پشتیبان"
         return (day, pretty, is_nazd)
-
     tmp["_t"] = tmp.apply(make_tuple, axis=1)
     tmp = tmp.dropna(subset=["_day"]).sort_values("_day", ascending=False)
-
     d={}
     for s,grp in tmp.groupby(serial_col):
         d[str(s)] = [t for t in grp["_t"].tolist() if t is not None]
     return d
 
 def pick_exit_after_alloc(exit_idx:dict, serial:str, alloc_day:int|None):
-    """برمی‌گرداند: (exit_day_key, exit_pretty, is_nazd) با شرط day >= تخصیص.
-       اگر خروجِ نزد پشتیبان موجود بود، همان را برمی‌دارد؛ وگرنه اولین خروج بعد از تخصیص.
-    """
     if alloc_day is None: return None, None, False
     items = exit_idx.get(str(serial))
     if not items: return None, None, False
-
-    # اولویت: نزد پشتیبان
+    # اول نزد پشتیبان
     for day, pretty, is_nazd in items:
         if day >= alloc_day and is_nazd:
             return day, pretty, True
-    # در غیر اینصورت اولین خروج بعد از تخصیص
+    # سپس اولین خروج بعد از تخصیص
     for day, pretty, is_nazd in items:
         if day >= alloc_day:
             return day, pretty, False
@@ -213,29 +181,33 @@ def pick_1025_after_alloc(idx_1025:dict, serial:str, alloc_day:int|None):
             return day, pretty
     return None, None
 
+# Excel column letter helper
+def col_letter(idx_zero_based:int) -> str:
+    s = ""
+    n = idx_zero_based + 1
+    while n:
+        n, rem = divmod(n-1, 26)
+        s = chr(65+rem) + s
+    return s
+
 # -------------------- اجرای اصلی --------------------
 def main():
-    # 1) ورودی‌ها
     df_install_full, df_1025, df_exit = load_inputs()
 
     serial_col = "سریال پایانه"
     alloc_col  = "تاریخ تخصیص تجهیز"
     proj_col   = "پروژه"
-    status_col = "وضعیت نصب"  # بله/خیر
+    status_col = "وضعیت نصب"
 
     for col in [serial_col, alloc_col, proj_col, status_col]:
         if col not in df_install_full.columns:
-            raise KeyError(f"ستون «{col}» در install.xlsx یافت نشد.")
+            raise KeyError(f"ستون «{col}» در install.xlsx نیست.")
 
     # حذف پروژه فروش
-    df_install_full = df_install_full[
-        df_install_full[proj_col].apply(lambda x: normalize_text(x) != "پروژه فروش")
-    ].copy()
+    df_install_full = df_install_full[df_install_full[proj_col].apply(lambda x: normalize_text(x)!="پروژه فروش")].copy()
 
     # Pending فقط وضعیت نصب = خیر
-    df_install = df_install_full[
-        df_install_full[status_col].apply(lambda x: normalize_text(x) == "خیر")
-    ].copy()
+    df_install = df_install_full[df_install_full[status_col].apply(lambda x: normalize_text(x)=="خیر")].copy()
 
     # استاندارد تخصیص
     df_install["__alloc_day"]    = df_install[alloc_col].apply(extract_day_key)
@@ -250,17 +222,14 @@ def main():
     idx_1025 = build_1025_index(df_1025, serial_col, date_col_1025)
     idx_exit = build_exit_index_with_flag(df_exit, serial_col, exit_date_col)
 
-    # 2) ساخت Pending (با پرچم از_نزد_پشتیبان)
+    # Pending
     rows=[]
     for _, r in df_install.iterrows():
         serial    = str(r.get(serial_col,""))
         alloc_day = r["__alloc_day"]
         alloc_pre = r["__alloc_pretty"]
 
-        # 1025 بعد از تخصیص (ممکن است None باشد)
         t1025_day, t1025_pre = pick_1025_after_alloc(idx_1025, serial, alloc_day)
-
-        # خروج فقط با تخصیص مقایسه می‌شود؛ اول نزد پشتیبان، بعد اولین خروج
         exit_day, exit_pre, is_nazd = pick_exit_after_alloc(idx_exit, serial, alloc_day)
 
         out = dict(r)
@@ -273,29 +242,32 @@ def main():
     df_pending = pd.DataFrame(rows)
     df_pending = normalize_columns(df_pending)
 
-    s1_cols = [
-        "کد پذیرنده","نام فروشگاه","شهر","آدرس","مدل پایانه","کد پایانه","سریال پایانه",
-        "نام خانوادگی پشتیبان","پروژه",
-        "تاریخ تخصیص تجهیز","تاریخ تراکنش 1025","خروج","از_نزد_پشتیبان",
-        "توضیح","مهلت","تاریخ نصب"
-    ]
+    s1_cols = ["کد پذیرنده","نام فروشگاه","شهر","آدرس","مدل پایانه","کد پایانه","سریال پایانه",
+               "نام خانوادگی پشتیبان","پروژه",
+               "تاریخ تخصیص تجهیز","تاریخ تراکنش 1025","خروج","از_نزد_پشتیبان",
+               "توضیح","مهلت","تاریخ نصب"]
     for c in s1_cols:
         if c not in df_pending.columns: df_pending[c]=pd.NA
     df_pending = df_pending[s1_cols]
 
-    # 3) نسخه قبلی
+    # نسخه قبلی
     prev_backup = backup_prev(OUTPUT)
     prev_pending, prev_sheet2, prev_archive = read_prev_triplet(prev_backup if prev_backup else OUTPUT)
 
-    # ----------- مرحله A: پاکسازی Sheet2 قبلی از نصب‌شده‌ها (حذف کامل) -----------
+    # شروع اجرا: شیت۲ قبلی را از نصب‌شده‌های بدون هشدار پاک کن
     sheet2 = prev_sheet2.copy()
     if not sheet2.empty:
-        sheet2 = sheet2[sheet2["تاریخ نصب"].isna()].copy()
+        warn_col = "هشدار_احتمال_تقلب" if "هشدار_احتمال_تقلب" in sheet2.columns else None
+        if warn_col:
+            mask_keep = sheet2["تاریخ نصب"].isna() | (sheet2[warn_col]==True)
+        else:
+            mask_keep = sheet2["تاریخ نصب"].isna()
+        sheet2 = sheet2[mask_keep].copy()
 
-    for c in ["تحویل پست","تاخیر روز"]:
+    for c in ["پایه_تاخیر","تحویل پست","تاخیر روز","هشدار_احتمال_تقلب"]:
         if c not in sheet2.columns: sheet2[c]=pd.NA
 
-    # ----------- مرحله B: افزودن نصب‌شده‌های جدید (prev_pending - curr_pending) به Sheet2 -----------
+    # افزودن نصب‌شده‌های جدید (prev_pending - curr_pending)
     prev_serials = set(prev_pending["سریال پایانه"].astype(str).fillna("")) if not prev_pending.empty else set()
     curr_serials = set(df_pending["سریال پایانه"].astype(str).fillna(""))   if not df_pending.empty else set()
     newly_installed_serials = prev_serials - curr_serials
@@ -303,7 +275,7 @@ def main():
         new_cands = prev_pending[prev_pending["سریال پایانه"].astype(str).isin(newly_installed_serials)].copy()
         sheet2 = pd.concat([sheet2, new_cands], ignore_index=True)
 
-    # ----------- مرحله C: تکمیل تاریخ نصب و تاخیر برای Sheet2 فعلی -----------
+    # تکمیل «تاریخ نصب» و «تاخیر» و «پایه_تاخیر» + Fraud
     df_lu = df_install_full.copy()
     if "تاریخ نصب" not in df_lu.columns:
         df_lu["تاریخ نصب"] = pd.NA
@@ -312,6 +284,9 @@ def main():
 
     install_days = []
     delays = []
+    bases  = []
+    frauds = []
+
     for _, row in sheet2.iterrows():
         serial = str(row.get("سریال پایانه","")).strip()
         merch  = str(row.get("کد پذیرنده","")).strip()
@@ -334,42 +309,97 @@ def main():
             inst_prett = sub["__install_pretty"].iloc[0]
             install_days.append(inst_prett)
 
-            # پایه تأخیر
-            base_day = exit_day if is_nazd else test_day
-            diff = days_diff_jalali(base_day, inst_day) if base_day is not None else None
-            if diff is None:
+            is_fraud = (test_day is not None and exit_day is not None and test_day > exit_day)
+            frauds.append(True if is_fraud else False)
+
+            if is_nazd:
+                base = exit_day; bases.append("خروج")
+            else:
+                base = test_day; bases.append("1025")
+
+            if is_fraud or base is None:
                 delays.append(pd.NA)
             else:
-                late = diff - sla_days(row.get("شهر"))
-                delays.append(int(late) if late>0 else 0)
+                diff = days_diff_jalali(base, inst_day)
+                if diff is None:
+                    delays.append(pd.NA)
+                else:
+                    late = diff - sla_days(row.get("شهر"))
+                    delays.append(int(late) if late>0 else 0)
         else:
             install_days.append(pd.NA)
             delays.append(pd.NA)
+            bases.append(pd.NA)
+            frauds.append(False)
 
     if not sheet2.empty:
         mask_fill = sheet2["تاریخ نصب"].isna()
         sheet2.loc[mask_fill, "تاریخ نصب"] = pd.Series(install_days, index=sheet2.index)[mask_fill]
         sheet2["تاخیر روز"] = pd.Series(delays, index=sheet2.index)
+        sheet2["پایه_تاخیر"] = pd.Series(bases, index=sheet2.index)
+        sheet2["هشدار_احتمال_تقلب"] = pd.Series(frauds, index=sheet2.index)
 
-    # ----------- مرحله D: آرشیو = prev_archive + نصب‌شده‌های همین اجرا (بدون حذف از شیت۲) -----------
+    # آرشیو: فقط نصب‌شده‌های همین اجرا که هشدار=False
     archive = prev_archive.copy()
-    installed_now = sheet2[sheet2["تاریخ نصب"].notna()].copy()
+    installed_now = sheet2[(sheet2["تاریخ نصب"].notna()) & (~sheet2["هشدار_احتمال_تقلب"].fillna(False))].copy()
     if not installed_now.empty:
         archive = pd.concat([archive, installed_now], ignore_index=True)
 
-    # یکتاسازی بر اساس سریال برای Sheet2
+    # یکتاسازی Sheet2
     if not sheet2.empty:
         sheet2 = sheet2.reset_index(drop=True)
         sheet2["_row"] = sheet2.index
         sheet2 = sheet2.sort_values("_row").drop_duplicates(subset=["سریال پایانه"], keep="last").drop(columns=["_row"])
 
-    # 4) ذخیره
+    # -------------------- ذخیره + استایل اکسل --------------------
     with pd.ExcelWriter(OUTPUT, engine="xlsxwriter") as w:
         df_pending.to_excel(w, index=False, sheet_name="Pending")
         sheet2.to_excel(w, index=False, sheet_name="Installed_Candidates")
         archive.to_excel(w, index=False, sheet_name="Archive")
+
+        # Right-to-Left
         for sh in ["Pending","Installed_Candidates","Archive"]:
             w.sheets[sh].right_to_left()
+
+        # های‌لایت‌ها روی Sheet2
+        ws2 = w.sheets["Installed_Candidates"]
+
+        # پیدا کردن ایندکس ستون‌ها
+        cols2 = list(sheet2.columns)
+        try:
+            warn_idx = cols2.index("هشدار_احتمال_تقلب")
+            delay_idx = cols2.index("تاخیر روز")
+        except ValueError:
+            warn_idx, delay_idx = None, None
+
+        # فرمت‌ها
+        warn_format = w.book.add_format({"bg_color": "#F8D7DA", "bold": True})  # قرمز کم‌رنگ
+        delay_format = w.book.add_format({"bg_color": "#FFE5B4"})               # نارنجی کم‌رنگ
+
+        # محدوده داده (با هدر): از A1 تا آخرین ستون/سطر
+        nrows = len(sheet2) + 1  # + header
+        ncols = len(cols2)
+        full_range = f"A1:{col_letter(ncols-1)}{nrows}"
+
+        # 1) ردیف‌هایی که هشدار=True → کل رنج ردیف قرمز
+        if warn_idx is not None and nrows > 1:
+            warn_col_letter = col_letter(warn_idx)
+            # از سطر 2 (بدون هدر) تا nrows
+            ws2.conditional_format(f"A2:{col_letter(ncols-1)}{nrows}", {
+                "type": "formula",
+                "criteria": f'=${warn_col_letter}2=TRUE',
+                "format": warn_format
+            })
+
+        # 2) سلول‌های «تاخیر روز» > 0 → نارنجی
+        if delay_idx is not None and nrows > 1:
+            delay_col_letter = col_letter(delay_idx)
+            ws2.conditional_format(f"{delay_col_letter}2:{delay_col_letter}{nrows}", {
+                "type": "cell",
+                "criteria": ">",
+                "value": 0,
+                "format": delay_format
+            })
 
     print("✅ Done")
     print(f"📄 Output: {OUTPUT}")
