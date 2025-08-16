@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-noInstall.py — رفتار موردنظر:
+noInstall.py — نسخه با منطق «نزد پشتیبان» و مقایسه‌ی خروج فقط با تخصیص
 - Pending از install با «وضعیت نصب = خیر»
-- شروع هر اجرا: شیت۲ قبلی را پاکسازی کن و هر ردیفی که «تاریخ نصب» دارد را حذف کن (آرشیو نکن)
-- کشف نصب‌های جدید همین اجرا و محاسبه تاریخ نصب/تاخیر → این ردیف‌ها را
-  1) در شیت۲ نگه دار  2) به شیت۳ نیز کپی کن
-- تاریخ‌ها استاندارد YYYY/MM/DD؛ منطق: تخصیص ≤ 1025 ≤ خروج؛ « - نزد پشتیبان» در خروج
+- انتخاب تاریخ‌ها (همه در سطح روز و استاندارد YYYY/MM/DD):
+    تخصیص: از install
+    1025: اولین رکورد با day >= تخصیص (اگر باشد)
+    خروج: فقط با تخصیص مقایسه می‌شود؛
+          اگر خروجِ «نزد پشتیبان» بعد از تخصیص بود → همان، flag=True
+          وگرنه اولین خروج بعد از تخصیص → flag=False
+- ستون جدید: «از_نزد_پشتیبان» (True/False)
+- تأخیر:
+    اگر از_نزد_پشتیبان=True → base=خروج
+    اگر False → base=1025
+    delay = max(0, (install - base) - SLA)  | SLA: مشهد=2 روز، بقیه=5
+- شروع هر اجرا: شیت۲ قدیمی از ردیف‌های تاریخ‌نصب‌دار پاک می‌شود (بدون انتقال)
+- پایان همین اجرا: نصب‌شده‌های این اجرا در شیت۲ می‌مانند و به آرشیو (شیت۳) هم کپی می‌شوند
 - شیت‌ها Right-to-Left
 """
 
@@ -86,11 +95,11 @@ def jalali_to_gregorian(jy, jm, jd):
         gd-=gmd[gm]; gm+=1
     return gy,gm,gd
 
-from datetime import date as _d
 def jalali_key_to_ordinal(key:int) -> int|None:
     y=key//10000; m=(key//100)%100; d=key%100
     try:
         gy,gm,gd = jalali_to_gregorian(y,m,d)
+        from datetime import date as _d
         return _d(gy,gm,gd).toordinal()
     except: return None
 
@@ -112,7 +121,7 @@ def read_prev_triplet(prev_path: Path):
     cols1 = [
         "کد پذیرنده","نام فروشگاه","شهر","آدرس","مدل پایانه","کد پایانه","سریال پایانه",
         "نام خانوادگی پشتیبان","پروژه",
-        "تاریخ تخصیص تجهیز","تاریخ تراکنش 1025","خروج",
+        "تاریخ تخصیص تجهیز","تاریخ تراکنش 1025","خروج","از_نزد_پشتیبان",
         "توضیح","مهلت","تاریخ نصب"
     ]
     ext  = cols1 + ["تحویل پست","تاخیر روز"]
@@ -140,7 +149,7 @@ def load_inputs():
             normalize_columns(pd.read_excel(f_1025)),
             normalize_columns(pd.read_excel(f_exit)))
 
-# -------------------- اندیس‌ها --------------------
+# -------------------- اندیس‌ها (با پرچم نزد پشتیبان) --------------------
 def build_1025_index(df_1025, serial_col, date_col):
     tmp = df_1025[[serial_col, date_col]].copy()
     tmp["_day"]    = tmp[date_col].apply(extract_day_key)
@@ -151,30 +160,56 @@ def build_1025_index(df_1025, serial_col, date_col):
         d[str(s)] = list(zip(grp["_day"].tolist(), grp["_pretty"].tolist()))
     return d
 
-def build_exit_index(df_exit, serial_col, date_col):
+def build_exit_index_with_flag(df_exit, serial_col, date_col):
     note_col = "توضیحات" if "توضیحات" in df_exit.columns else None
     cols = [serial_col, date_col] + ([note_col] if note_col else [])
     tmp = df_exit[cols].copy()
     tmp["_day"]    = tmp[date_col].apply(extract_day_key)
     tmp["_pretty"] = tmp[date_col].apply(pretty_jalali)
-    if note_col:
-        tmp["_pretty_out"] = tmp.apply(
-            lambda r: (None if r["_pretty"] is None else (r["_pretty"] + " - نزد پشتیبان"
-                        if "نزد پشتیبان" in normalize_text(r[note_col]) else r["_pretty"])), axis=1)
-    else:
-        tmp["_pretty_out"] = tmp["_pretty"]
+
+    def make_tuple(row):
+        day = row["_day"]
+        if day is None: return None
+        pretty = row["_pretty"]
+        is_nazd = False
+        if note_col:
+            is_nazd = "نزد پشتیبان" in normalize_text(row[note_col])
+            if pretty is not None and is_nazd:
+                pretty = pretty + " - نزد پشتیبان"
+        return (day, pretty, is_nazd)
+
+    tmp["_t"] = tmp.apply(make_tuple, axis=1)
     tmp = tmp.dropna(subset=["_day"]).sort_values("_day", ascending=False)
+
     d={}
     for s,grp in tmp.groupby(serial_col):
-        d[str(s)] = list(zip(grp["_day"].tolist(), grp["_pretty_out"].tolist()))
+        d[str(s)] = [t for t in grp["_t"].tolist() if t is not None]
     return d
 
-def pick_after(index_dict, serial:str, min_day:int|None):
-    if min_day is None: return None, None
-    items = index_dict.get(str(serial))
+def pick_exit_after_alloc(exit_idx:dict, serial:str, alloc_day:int|None):
+    """برمی‌گرداند: (exit_day_key, exit_pretty, is_nazd) با شرط day >= تخصیص.
+       اگر خروجِ نزد پشتیبان موجود بود، همان را برمی‌دارد؛ وگرنه اولین خروج بعد از تخصیص.
+    """
+    if alloc_day is None: return None, None, False
+    items = exit_idx.get(str(serial))
+    if not items: return None, None, False
+
+    # اولویت: نزد پشتیبان
+    for day, pretty, is_nazd in items:
+        if day >= alloc_day and is_nazd:
+            return day, pretty, True
+    # در غیر اینصورت اولین خروج بعد از تخصیص
+    for day, pretty, is_nazd in items:
+        if day >= alloc_day:
+            return day, pretty, False
+    return None, None, False
+
+def pick_1025_after_alloc(idx_1025:dict, serial:str, alloc_day:int|None):
+    if alloc_day is None: return None, None
+    items = idx_1025.get(str(serial))
     if not items: return None, None
     for day, pretty in items:
-        if day >= min_day:
+        if day >= alloc_day:
             return day, pretty
     return None, None
 
@@ -206,30 +241,33 @@ def main():
     df_install["__alloc_day"]    = df_install[alloc_col].apply(extract_day_key)
     df_install["__alloc_pretty"] = df_install[alloc_col].apply(pretty_jalali)
 
-    # ستون تاریخ‌ها در 1025 و خروج
+    # ایندکس‌ها
     date_col_1025 = next(c for c in df_1025.columns if "تاریخ" in c)
     if serial_col not in df_exit.columns and "سریال" in df_exit.columns:
         df_exit.rename(columns={"سریال": serial_col}, inplace=True)
     exit_date_col = next(c for c in df_exit.columns if "تاریخ" in c)
 
-    # ایندکس‌ها
     idx_1025 = build_1025_index(df_1025, serial_col, date_col_1025)
-    idx_exit = build_exit_index(df_exit, serial_col, exit_date_col)
+    idx_exit = build_exit_index_with_flag(df_exit, serial_col, exit_date_col)
 
-    # 2) ساخت Pending
+    # 2) ساخت Pending (با پرچم از_نزد_پشتیبان)
     rows=[]
     for _, r in df_install.iterrows():
         serial    = str(r.get(serial_col,""))
         alloc_day = r["__alloc_day"]
         alloc_pre = r["__alloc_pretty"]
 
-        t1025_day, t1025_pre = pick_after(idx_1025, serial, alloc_day)
-        exit_day,  exit_pre  = pick_after(idx_exit,  serial, t1025_day)
+        # 1025 بعد از تخصیص (ممکن است None باشد)
+        t1025_day, t1025_pre = pick_1025_after_alloc(idx_1025, serial, alloc_day)
+
+        # خروج فقط با تخصیص مقایسه می‌شود؛ اول نزد پشتیبان، بعد اولین خروج
+        exit_day, exit_pre, is_nazd = pick_exit_after_alloc(idx_exit, serial, alloc_day)
 
         out = dict(r)
         out["تاریخ تخصیص تجهیز"] = alloc_pre
         out["تاریخ تراکنش 1025"] = t1025_pre
         out["خروج"]              = exit_pre
+        out["از_نزد_پشتیبان"]   = bool(is_nazd)
         rows.append(out)
 
     df_pending = pd.DataFrame(rows)
@@ -238,18 +276,18 @@ def main():
     s1_cols = [
         "کد پذیرنده","نام فروشگاه","شهر","آدرس","مدل پایانه","کد پایانه","سریال پایانه",
         "نام خانوادگی پشتیبان","پروژه",
-        "تاریخ تخصیص تجهیز","تاریخ تراکنش 1025","خروج",
+        "تاریخ تخصیص تجهیز","تاریخ تراکنش 1025","خروج","از_نزد_پشتیبان",
         "توضیح","مهلت","تاریخ نصب"
     ]
     for c in s1_cols:
         if c not in df_pending.columns: df_pending[c]=pd.NA
     df_pending = df_pending[s1_cols]
 
-    # 3) نسخه قبلی: بکاپ + خواندن
+    # 3) نسخه قبلی
     prev_backup = backup_prev(OUTPUT)
     prev_pending, prev_sheet2, prev_archive = read_prev_triplet(prev_backup if prev_backup else OUTPUT)
 
-    # ----------- مرحله A: پاکسازی Sheet2 قبلی از نصب‌شده‌ها (حذف کامل؛ آرشیو نکن) -----------
+    # ----------- مرحله A: پاکسازی Sheet2 قبلی از نصب‌شده‌ها (حذف کامل) -----------
     sheet2 = prev_sheet2.copy()
     if not sheet2.empty:
         sheet2 = sheet2[sheet2["تاریخ نصب"].isna()].copy()
@@ -279,6 +317,8 @@ def main():
         merch  = str(row.get("کد پذیرنده","")).strip()
         alloc_day = extract_day_key(row.get("تاریخ تخصیص تجهیز"))
         test_day  = extract_day_key(row.get("تاریخ تراکنش 1025"))
+        exit_day  = extract_day_key(row.get("خروج"))
+        is_nazd   = str(row.get("از_نزد_پشتیبان","")).strip().lower() in ("true","1","بله","yes")
 
         sub = df_lu[
             (df_lu["سریال پایانه"].astype(str).str.strip()==serial) &
@@ -293,7 +333,10 @@ def main():
             inst_day   = int(sub["__install_day"].iloc[0])
             inst_prett = sub["__install_pretty"].iloc[0]
             install_days.append(inst_prett)
-            diff = days_diff_jalali(test_day, inst_day)
+
+            # پایه تأخیر
+            base_day = exit_day if is_nazd else test_day
+            diff = days_diff_jalali(base_day, inst_day) if base_day is not None else None
             if diff is None:
                 delays.append(pd.NA)
             else:
@@ -314,7 +357,7 @@ def main():
     if not installed_now.empty:
         archive = pd.concat([archive, installed_now], ignore_index=True)
 
-    # یکتاسازی بر اساس سریال برای Sheet2 (آخرین ردیف بماند)
+    # یکتاسازی بر اساس سریال برای Sheet2
     if not sheet2.empty:
         sheet2 = sheet2.reset_index(drop=True)
         sheet2["_row"] = sheet2.index
