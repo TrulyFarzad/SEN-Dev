@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-noInstall.py — با ستون‌های «از_نزد_پشتیبان»، «پایه_تاخیر»، «هشدار_احتمال_تقلب»
-و استایل رنگی برای هشدار/تاخیر در اکسل (xlsxwriter)
+noInstall.py — نگهداری «توضیح» بین اجراها + ستون‌های «از_نزد_پشتیبان»، «پایه_تاخیر»، «هشدار_احتمال_تقلب»
+و استایل رنگی برای هشدار/تاخیر
 """
 
 import sys, os, shutil, re
@@ -190,6 +190,11 @@ def col_letter(idx_zero_based:int) -> str:
         s = chr(65+rem) + s
     return s
 
+def coalesce_text(a, b):
+    a_ = normalize_text(a)
+    b_ = normalize_text(b)
+    return a if a_ != "" else (b if b_ != "" else a)
+
 # -------------------- اجرای اصلی --------------------
 def main():
     df_install_full, df_1025, df_exit = load_inputs()
@@ -253,6 +258,19 @@ def main():
     # نسخه قبلی
     prev_backup = backup_prev(OUTPUT)
     prev_pending, prev_sheet2, prev_archive = read_prev_triplet(prev_backup if prev_backup else OUTPUT)
+
+    # --- نگهداری توضیحات: merge روی سریال پایانه ---
+    if not prev_pending.empty and not df_pending.empty:
+        df_pending = df_pending.merge(
+            prev_pending[["سریال پایانه","توضیح"]],
+            on="سریال پایانه", how="left", suffixes=("", "_old")
+        )
+        # coalesce: اگر توضیح جدید خالی است، از قدیمی بردار
+        df_pending["توضیح"] = df_pending.apply(
+            lambda r: coalesce_text(r.get("توضیح"), r.get("توضیح_old")), axis=1
+        )
+        if "توضیح_old" in df_pending.columns:
+            df_pending.drop(columns=["توضیح_old"], inplace=True)
 
     # شروع اجرا: شیت۲ قبلی را از نصب‌شده‌های بدون هشدار پاک کن
     sheet2 = prev_sheet2.copy()
@@ -364,7 +382,6 @@ def main():
         # های‌لایت‌ها روی Sheet2
         ws2 = w.sheets["Installed_Candidates"]
 
-        # پیدا کردن ایندکس ستون‌ها
         cols2 = list(sheet2.columns)
         try:
             warn_idx = cols2.index("هشدار_احتمال_تقلب")
@@ -372,26 +389,22 @@ def main():
         except ValueError:
             warn_idx, delay_idx = None, None
 
-        # فرمت‌ها
-        warn_format = w.book.add_format({"bg_color": "#F8D7DA", "bold": True})  # قرمز کم‌رنگ
-        delay_format = w.book.add_format({"bg_color": "#FFE5B4"})               # نارنجی کم‌رنگ
+        warn_format = w.book.add_format({"bg_color": "#F8D7DA", "bold": True})
+        delay_format = w.book.add_format({"bg_color": "#FFE5B4"})
 
-        # محدوده داده (با هدر): از A1 تا آخرین ستون/سطر
-        nrows = len(sheet2) + 1  # + header
+        nrows = len(sheet2) + 1
         ncols = len(cols2)
-        full_range = f"A1:{col_letter(ncols-1)}{nrows}"
 
-        # 1) ردیف‌هایی که هشدار=True → کل رنج ردیف قرمز
+        # هشدار: کل ردیف قرمز کم‌رنگ
         if warn_idx is not None and nrows > 1:
             warn_col_letter = col_letter(warn_idx)
-            # از سطر 2 (بدون هدر) تا nrows
             ws2.conditional_format(f"A2:{col_letter(ncols-1)}{nrows}", {
                 "type": "formula",
                 "criteria": f'=${warn_col_letter}2=TRUE',
                 "format": warn_format
             })
 
-        # 2) سلول‌های «تاخیر روز» > 0 → نارنجی
+        # تاخیر>0: سلول تاخیر نارنجی
         if delay_idx is not None and nrows > 1:
             delay_col_letter = col_letter(delay_idx)
             ws2.conditional_format(f"{delay_col_letter}2:{delay_col_letter}{nrows}", {
